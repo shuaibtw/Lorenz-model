@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Lorenz (x,z) projection — vary rho (r)</title>
+  <style>
+    :root { --bg:#0b0f14; --panel:#121926; --text:#e6edf3; --muted:#9fb0c0; --line:#243041; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { display:grid; grid-template-columns: 340px 1fr; min-height:100vh; }
+    .panel {
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    h1 { font-size: 16px; margin: 0 0 10px; }
+    .row { margin: 12px 0; }
+    label { display:block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input[type="number"], input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      box-sizing: border-box;
+      border: 1px solid var(--line);
+      background:#0e1522;
+      color: var(--text);
+      border-radius: 10px;
+      outline: none;
+    }
+    input[type="range"] { width: 100%; }
+    .inline { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .btns { display:flex; gap:10px; flex-wrap: wrap; margin-top: 12px; }
+    button {
+      padding: 9px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #0e1522;
+      color: var(--text);
+      cursor: pointer;
+    }
+    button:hover { border-color:#365074; }
+    .hint { font-size: 12px; color: var(--muted); line-height: 1.35; }
+    .main { padding: 12px; box-sizing: border-box; }
+    canvas { width: 100%; height: calc(100vh - 24px); background:#070b10; border: 1px solid var(--line); border-radius: 14px; display:block; }
+    .readout { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.35; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h1>Lorenz (x,z) projection</h1>
+      <div class="hint">
+        Vary <span class="mono">ρ (r)</span> and re-run to see how trajectories change in the <span class="mono">(x,z)</span> plane.
+        </div>
+
+      <div class="row">
+        <label>ρ (r): <span id="rhoLabel" class="mono"></span></label>
+        <input id="rho" type="range" min="0" max="50" step="0.1" value="2" />
+      </div>
+
+      <div class="inline">
+        <div class="row">
+          <label>σ</label>
+          <input id="sigma" type="number" step="0.1" value="10" />
+        </div>
+        <div class="row">
+          <label>β</label>
+          <input id="beta" type="number" step="0.001" value="2.6666666667" />
+        </div>
+      </div>
+
+      <div class="inline">
+        <div class="row">
+          <label>Total time T</label>
+          <input id="T" type="number" step="0.1" value="10" />
+        </div>
+        <div class="row">
+          <label>Time step dt</label>
+          <input id="dt" type="number" step="0.001" value="0.01" />
+        </div>
+      </div>
+
+      <div class="inline">
+        <div class="row">
+          <label># trajectories</label>
+          <input id="repeat" type="number" step="1" min="1" max="200" value="10" />
+        </div>
+        <div class="row">
+          <label>Init range (uniform in [-a, a])</label>
+          <input id="initA" type="number" step="0.1" value="1" />
+        </div>
+      </div>
+
+      <div class="row">
+        <label>random number generator(stay the same if unchanged)</label>
+        <input id="seed" type="text" value="42" />
+      </div>
+
+      <div class="btns">
+        <button id="rerollBtn">New random inits</button>
+        <button id="clearBtn">Clear</button>
+        <button id="autoBtn" data-on="0">Auto-run: OFF</button>
+      </div>
+
+      <div class="readout" id="readout"></div>
+    </div>
+
+    <div class="main">
+      <canvas id="c"></canvas>
+    </div>
+  </div>
+
+<script>
+/* ---------- Small deterministic RNG (Mulberry32) ---------- */
+function xmur3(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return function() {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+}
+function mulberry32(a) {
+  return function() {
+    let t = (a += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+}
+
+/* ---------- Lorenz dynamics ---------- */
+function lorenzDeriv(x, y, z, sigma, rho, beta) {
+  const dx = sigma * (y - x);
+  const dy = x * (rho - z) - y;
+  const dz = x * y - beta * z;
+  return [dx, dy, dz];
+}
+
+function rk4Step(state, dt, sigma, rho, beta) {
+  const [x, y, z] = state;
+
+  const k1 = lorenzDeriv(x, y, z, sigma, rho, beta);
+
+  const x2 = x + 0.5 * dt * k1[0];
+  const y2 = y + 0.5 * dt * k1[1];
+  const z2 = z + 0.5 * dt * k1[2];
+  const k2 = lorenzDeriv(x2, y2, z2, sigma, rho, beta);
+
+  const x3 = x + 0.5 * dt * k2[0];
+  const y3 = y + 0.5 * dt * k2[1];
+  const z3 = z + 0.5 * dt * k2[2];
+  const k3 = lorenzDeriv(x3, y3, z3, sigma, rho, beta);
+
+  const x4 = x + dt * k3[0];
+  const y4 = y + dt * k3[1];
+  const z4 = z + dt * k3[2];
+  const k4 = lorenzDeriv(x4, y4, z4, sigma, rho, beta);
+
+  return [
+    x + (dt / 6) * (k1[0] + 2*k2[0] + 2*k3[0] + k4[0]),
+    y + (dt / 6) * (k1[1] + 2*k2[1] + 2*k3[1] + k4[1]),
+    z + (dt / 6) * (k1[2] + 2*k2[2] + 2*k3[2] + k4[2]),
+  ];
+}
+
+/* ---------- Canvas plot helpers ---------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resizeCanvas() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels
+}
+window.addEventListener("resize", () => { resizeCanvas(); drawLast(); });
+
+function clearCanvas() {
+  const w = canvas.getBoundingClientRect().width;
+  const h = canvas.getBoundingClientRect().height;
+  ctx.clearRect(0, 0, w, h);
+  // background already via CSS; but clearRect reveals it
+}
+
+function drawAxes(bounds) {
+  const w = canvas.getBoundingClientRect().width;
+  const h = canvas.getBoundingClientRect().height;
+  const pad = 42;
+
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(160,180,200,0.25)";
+  ctx.fillStyle = "rgba(160,180,200,0.75)";
+  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace";
+
+  // border
+  ctx.strokeRect(pad, pad, w - 2*pad, h - 2*pad);
+
+  // ticks + labels
+  const {xmin, xmax, zmin, zmax} = bounds;
+
+  function niceTicks(min, max, n=5) {
+    const span = max - min || 1;
+    const stepRaw = span / n;
+    const pow10 = Math.pow(10, Math.floor(Math.log10(stepRaw)));
+    const stepNice = Math.ceil(stepRaw / pow10) * pow10;
+    const start = Math.floor(min / stepNice) * stepNice;
+    const ticks = [];
+    for (let v = start; v <= max + 1e-9; v += stepNice) ticks.push(v);
+    return ticks;
+  }
+
+  const xt = niceTicks(xmin, xmax, 5);
+  const zt = niceTicks(zmin, zmax, 5);
+
+  // mapping
+  const mapX = x => pad + (x - xmin) * (w - 2*pad) / (xmax - xmin || 1);
+  const mapZ = z => h - pad - (z - zmin) * (h - 2*pad) / (zmax - zmin || 1);
+
+  // x ticks
+  ctx.strokeStyle = "rgba(160,180,200,0.18)";
+  for (const v of xt) {
+    const px = mapX(v);
+    ctx.beginPath();
+    ctx.moveTo(px, h - pad);
+    ctx.lineTo(px, h - pad + 6);
+    ctx.stroke();
+    ctx.fillText(v.toFixed(2), px - 18, h - pad + 18);
+  }
+  // z ticks
+  for (const v of zt) {
+    const pz = mapZ(v);
+    ctx.beginPath();
+    ctx.moveTo(pad - 6, pz);
+    ctx.lineTo(pad, pz);
+    ctx.stroke();
+    ctx.fillText(v.toFixed(2), 6, pz + 4);
+  }
+
+  // axis labels
+  ctx.fillStyle = "rgba(230,237,243,0.85)";
+  ctx.fillText("x", w/2, h - 10);
+  ctx.save();
+  ctx.translate(14, h/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.fillText("z", 0, 0);
+  ctx.restore();
+
+  ctx.restore();
+}
+
+function hueColor(i, n) {
+  const hue = (i * 360 / Math.max(1, n)) % 360;
+  return `hsla(${hue}, 85%, 65%, 0.9)`;
+}
+
+function drawXMarker(px, py, size=7, color="rgba(255,80,80,0.95)") {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(px - size, py - size);
+  ctx.lineTo(px + size, py + size);
+  ctx.moveTo(px - size, py + size);
+  ctx.lineTo(px + size, py - size);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTriangle(px, py, size=6, color="rgba(120,170,255,0.95)") {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(px, py - size);
+  ctx.lineTo(px - size, py + size);
+  ctx.lineTo(px + size, py + size);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ---------- Simulation + plotting ---------- */
+let lastPlot = null; // keep for redraw on resize
+
+function simulateAndPlot({sigma, beta, rho, T, dt, repeat, initA, seedStr}) {
+  const steps = Math.max(1, Math.floor(T / dt));
+  const seedGen = xmur3(seedStr);
+  const rng = mulberry32(seedGen());
+
+  // Generate initial conditions in [-initA, initA]^3
+  const inits = Array.from({length: repeat}, () => ([
+    (rng()*2 - 1) * initA,
+    (rng()*2 - 1) * initA,
+    (rng()*2 - 1) * initA,
+  ]));
+
+  // Integrate each trajectory
+  const trajs = [];
+  let xmin = Infinity, xmax = -Infinity, zmin = Infinity, zmax = -Infinity;
+
+  for (let i = 0; i < repeat; i++) {
+    let state = inits[i].slice();
+    const xs = new Float64Array(steps);
+    const zs = new Float64Array(steps);
+
+    for (let k = 0; k < steps; k++) {
+      xs[k] = state[0];
+      zs[k] = state[2];
+      if (xs[k] < xmin) xmin = xs[k];
+      if (xs[k] > xmax) xmax = xs[k];
+      if (zs[k] < zmin) zmin = zs[k];
+      if (zs[k] > zmax) zmax = zs[k];
+      state = rk4Step(state, dt, sigma, rho, beta);
+    }
+    trajs.push({xs, zs, x0: xs[0], z0: zs[0]});
+  }
+
+  // Add fixed points to bounds so they stay visible
+  // Trivial fixed point: (0,0,0) => (x,z)=(0,0)
+  xmin = Math.min(xmin, 0); xmax = Math.max(xmax, 0);
+  zmin = Math.min(zmin, 0); zmax = Math.max(zmax, 0);
+
+  let fixed = [];
+  if (rho > 1) {
+    const x1 = Math.sqrt(beta * (rho - 1));
+    const z1 = rho - 1;
+    fixed.push([ x1, z1 ], [ -x1, z1 ]);
+    xmin = Math.min(xmin, -x1); xmax = Math.max(xmax, x1);
+    zmin = Math.min(zmin, z1);   zmax = Math.max(zmax, z1);
+  }
+  fixed.push([0,0]);
+
+  // Expand bounds a bit for padding
+  const padFrac = 0.08;
+  const dx = (xmax - xmin) || 1;
+  const dz = (zmax - zmin) || 1;
+  xmin -= dx * padFrac; xmax += dx * padFrac;
+  zmin -= dz * padFrac; zmax += dz * padFrac;
+
+  // Plot on canvas
+  clearCanvas();
+  const w = canvas.getBoundingClientRect().width;
+  const h = canvas.getBoundingClientRect().height;
+  const pad = 42;
+
+  const mapX = x => pad + (x - xmin) * (w - 2*pad) / (xmax - xmin || 1);
+  const mapZ = z => h - pad - (z - zmin) * (h - 2*pad) / (zmax - zmin || 1);
+
+  drawAxes({xmin, xmax, zmin, zmax});
+
+  // Draw trajectories
+  ctx.save();
+  ctx.lineWidth = 1.2;
+  for (let i = 0; i < trajs.length; i++) {
+    const {xs, zs, x0, z0} = trajs[i];
+    ctx.strokeStyle = hueColor(i, trajs.length);
+    ctx.beginPath();
+    ctx.moveTo(mapX(xs[0]), mapZ(zs[0]));
+    for (let k = 1; k < xs.length; k++) ctx.lineTo(mapX(xs[k]), mapZ(zs[k]));
+    ctx.stroke();
+
+    // Start marker (blue triangle like your Python)
+    drawTriangle(mapX(x0), mapZ(z0));
+  }
+  ctx.restore();
+
+  // Draw fixed points (red X)
+  for (const [fx, fz] of fixed) {
+    drawXMarker(mapX(fx), mapZ(fz), 7);
+  }
+
+  // Store last plot for resize redraw
+  lastPlot = {sigma, beta, rho, T, dt, repeat, initA, seedStr};
+
+  // Readout
+  const readout = document.getElementById("readout");
+  const nontrivial = (rho > 1)
+    ? `Nontrivial fixed points in (x,z): (±${Math.sqrt(beta*(rho-1)).toFixed(4)}, ${(rho-1).toFixed(4)})`
+    : `ρ ≤ 1 → nontrivial fixed points do not exist (real-valued).`;
+  readout.innerHTML = `
+    <div><span class="mono">steps</span>: ${steps.toLocaleString()} &nbsp;|&nbsp; <span class="mono">repeat</span>: ${repeat}</div>
+    <div>${nontrivial}</div>
+    <div class="hint">Tip: turn on Auto-run, then drag the ρ slider.</div>
+  `;
+}
+
+function drawLast() {
+  if (!lastPlot) return;
+  simulateAndPlot(lastPlot);
+}
+
+/* ---------- UI wiring ---------- */
+const rhoEl   = document.getElementById("rho");
+const rhoLab  = document.getElementById("rhoLabel");
+const sigmaEl = document.getElementById("sigma");
+const betaEl  = document.getElementById("beta");
+const TEl     = document.getElementById("T");
+const dtEl    = document.getElementById("dt");
+const repEl   = document.getElementById("repeat");
+const initAEl = document.getElementById("initA");
+const seedEl  = document.getElementById("seed");
+
+function getParams() {
+  const sigma = Number(sigmaEl.value);
+  const beta  = Number(betaEl.value);
+  const rho   = Number(rhoEl.value);
+  const T     = Math.max(0.001, Number(TEl.value));
+  const dt    = Math.max(1e-5, Number(dtEl.value));
+  const repeat= Math.max(1, Math.floor(Number(repEl.value)));
+  const initA = Math.max(1e-9, Number(initAEl.value));
+  const seedStr = String(seedEl.value ?? "0");
+  return {sigma, beta, rho, T, dt, repeat, initA, seedStr};
+}
+
+function run() {
+  const p = getParams();
+  rhoLab.textContent = p.rho.toFixed(1);
+  simulateAndPlot(p);
+}
+
+function rerollInits() {
+  // Change seed by appending a nonce so user doesn't have to type
+  const nonce = Math.floor(Math.random() * 1e9).toString(36);
+  seedEl.value = `${seedEl.value}-${nonce}`;
+  run();
+}
+
+document.getElementById("rerollBtn").addEventListener("click", rerollInits);
+document.getElementById("clearBtn").addEventListener("click", () => { lastPlot = null; clearCanvas(); });
+
+const autoBtn = document.getElementById("autoBtn");
+let autoOn = false;
+let autoTimer = null;
+
+function setAuto(on) {
+  autoOn = on;
+  autoBtn.textContent = `Auto-run: ${autoOn ? "ON" : "OFF"}`;
+  autoBtn.dataset.on = autoOn ? "1" : "0";
+  if (!autoOn && autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+}
+autoBtn.addEventListener("click", () => setAuto(!autoOn));
+
+function debounceRun() {
+  if (!autoOn) return;
+  if (autoTimer) clearTimeout(autoTimer);
+  autoTimer = setTimeout(run, 60);
+}
+
+// Update label live
+rhoEl.addEventListener("input", () => {
+  rhoLab.textContent = Number(rhoEl.value).toFixed(1);
+  debounceRun();
+});
+[sigmaEl, betaEl, TEl, dtEl, repEl, initAEl, seedEl].forEach(el => {
+  el.addEventListener("change", () => { if (autoOn) run(); });
+});
+
+/* ---------- Init ---------- */
+resizeCanvas();
+rhoLab.textContent = Number(rhoEl.value).toFixed(1);
+run();
+</script>
+</body>
+</html>
